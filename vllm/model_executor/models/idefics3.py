@@ -16,6 +16,7 @@
 # limitations under the License.
 """Inference-only Idefics3 model compatible with HuggingFace weights."""
 
+import math
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Annotated, Literal, TypeAlias
 
@@ -28,13 +29,15 @@ from transformers import (
     Idefics3Processor,
 )
 
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, str_dtype_to_torch_dtype
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.inputs import MultiModalDataDict
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateDtypeCalculator, MambaStateShapeCalculator)
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
@@ -62,6 +65,7 @@ from .interfaces import (
     SupportsMultiModal,
 )
 from .llama import LlamaModel
+from .granitemoehybrid import GraniteMoeHybridModel
 from .utils import AutoWeightsLoader, maybe_prefix
 
 
@@ -472,16 +476,113 @@ class Idefics3Model(nn.Module):
             quant_config,
             prefix=maybe_prefix(prefix, "connector"),
         )
-        self.text_model = LlamaModel(
-            vllm_config=vllm_config.with_hf_config(config.text_config),
-            prefix=maybe_prefix(prefix, "text_model"),
+
+        # Check if text_config is GraniteMoeHybridConfig
+        text_config = config.text_config
+        is_granitemoehybrid = (
+            getattr(text_config, "model_type", None) == "granitemoehybrid"
+            or (hasattr(text_config, "layer_types")
+                and text_config.layer_types is not None)
         )
+        if is_granitemoehybrid:
+            self._configure_granite_hybrid_cache(vllm_config, text_config)
+            self.text_model = GraniteMoeHybridModel(
+                vllm_config=vllm_config.with_hf_config(text_config),
+                prefix=maybe_prefix(prefix, "text_model"),
+            )
+        else:
+            self.text_model = LlamaModel(
+                vllm_config=vllm_config.with_hf_config(text_config),
+                prefix=maybe_prefix(prefix, "text_model"),
+            )
 
         self.image_seq_len = int(
             ((config.vision_config.image_size // config.vision_config.patch_size) ** 2)
             / (config.scale_factor**2)
         )
         self.image_token_id = self.config.image_token_id
+
+    @staticmethod
+    def _configure_granite_hybrid_cache(vllm_config: VllmConfig,
+                                        text_config) -> None:
+        cache_config = vllm_config.cache_config
+        parallel_config = vllm_config.parallel_config
+
+        def _to_torch_dtype(dtype: object) -> torch.dtype:
+            if isinstance(dtype, torch.dtype):
+                return dtype
+            if hasattr(dtype, "value"):
+                # ModelDType enum
+                return _to_torch_dtype(dtype.value)
+            if isinstance(dtype, str):
+                return str_dtype_to_torch_dtype(dtype)
+            raise TypeError(f"Unsupported dtype representation: {dtype}")
+
+        def _dtype_size(dtype: object) -> int:
+            torch_dtype = _to_torch_dtype(dtype)
+            return torch.empty((), dtype=torch_dtype).element_size()
+
+        model_dtype = vllm_config.model_config.dtype
+        if isinstance(model_dtype, str):
+            model_dtype = str_dtype_to_torch_dtype(model_dtype)
+
+        if cache_config.cache_dtype == "auto":
+            kv_cache_dtype = model_dtype
+        else:
+            kv_cache_dtype = str_dtype_to_torch_dtype(cache_config.cache_dtype)
+        kv_dtype_size = _dtype_size(kv_cache_dtype)
+
+        num_kv_heads = getattr(text_config, "num_key_value_heads",
+                               text_config.num_attention_heads)
+        head_dim = text_config.hidden_size // text_config.num_attention_heads
+        attn_bytes_per_token = 2 * num_kv_heads * head_dim * kv_dtype_size
+        if attn_bytes_per_token <= 0:
+            raise ValueError("Invalid attention bytes per token computed for "
+                             "GraniteMoeHybrid backend.")
+
+        mamba_head_dim = getattr(text_config, "mamba_d_head", None)
+        if isinstance(mamba_head_dim, str) and mamba_head_dim == "auto":
+            mamba_head_dim = text_config.hidden_size // text_config.mamba_n_heads
+
+        conv_shape, temporal_shape = MambaStateShapeCalculator.mamba2_state_shape(
+            tp_world_size=parallel_config.tensor_parallel_size,
+            intermediate_size=text_config.mamba_expand * text_config.hidden_size,
+            n_groups=text_config.mamba_n_groups,
+            num_heads=text_config.mamba_n_heads,
+            head_dim=mamba_head_dim,
+            state_size=text_config.mamba_d_state,
+            conv_kernel=text_config.mamba_d_conv,
+        )
+
+        conv_dtype, temporal_dtype = MambaStateDtypeCalculator.mamba2_state_dtype(
+            vllm_config.model_config.dtype,
+            cache_config.mamba_cache_dtype,
+            cache_config.mamba_ssm_cache_dtype,
+        )
+
+        mamba_page_size = (
+            math.prod(conv_shape) * _dtype_size(conv_dtype) +
+            math.prod(temporal_shape) * _dtype_size(temporal_dtype))
+
+        attn_bytes_per_token = max(attn_bytes_per_token, 1)
+        # Align to multiples of 16, matching HybridAttentionMambaModelConfig.
+        attn_block_size = max(
+            16,
+            16 * math.ceil(mamba_page_size / (16 * attn_bytes_per_token)),
+        )
+
+        if (
+            cache_config.block_size is None
+            or cache_config.block_size < attn_block_size
+        ):
+            cache_config.block_size = attn_block_size
+
+        attn_page_size = cache_config.block_size * attn_bytes_per_token
+        padded_size = max(attn_page_size,
+                          cache_config.mamba_page_size_padded
+                          or 0,
+                          mamba_page_size)
+        cache_config.mamba_page_size_padded = int(padded_size)
 
     def image_pixels_to_features(
         self,
