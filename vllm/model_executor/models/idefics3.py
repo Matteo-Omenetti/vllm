@@ -104,7 +104,24 @@ ImageInputs: TypeAlias = Idefics3ImagePixelInputs | Idefics3ImageEmbeddingInputs
 
 class Idefics3ProcessingInfo(BaseProcessingInfo):
     def get_hf_processor(self, **kwargs: object) -> Idefics3Processor:
-        return self.ctx.get_hf_processor(Idefics3Processor, **kwargs)
+        processor = self.ctx.get_hf_processor(Idefics3Processor, **kwargs)
+        # When the model specifies GotOcr2ImageProcessor (crop_to_patches
+        # mode) in its preprocessor config, the Idefics3Processor may load
+        # an Idefics3ImageProcessor instead.  The Idefics3ImageProcessor uses
+        # its own default max_image_size (364) producing patches that are
+        # incompatible with the vision model.  Swap in the correct processor.
+        ip = processor.image_processor
+        if (getattr(ip, 'crop_to_patches', False)
+                and type(ip).__name__ != 'GotOcr2ImageProcessor'):
+            if not hasattr(self, '_got_image_processor'):
+                from transformers import AutoImageProcessor
+                self._got_image_processor = (
+                    AutoImageProcessor.from_pretrained(
+                        self.ctx.model_config.model))
+            if type(self._got_image_processor).__name__ == (
+                    'GotOcr2ImageProcessor'):
+                processor.image_processor = self._got_image_processor
+        return processor
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"image": None}
@@ -185,6 +202,16 @@ class Idefics3ProcessingInfo(BaseProcessingInfo):
     ) -> tuple[int, int, int]:
         image_processor: Idefics3ImageProcessor = processor.image_processor
 
+        # GotOcr2-style crop_to_patches: find optimal grid based on
+        # aspect ratio, matching the GotOcr2ImageProcessor algorithm.
+        if getattr(image_processor, 'crop_to_patches', False):
+            grid_w, grid_h = self._get_crop_to_patches_grid_size(
+                image_width=image_width,
+                image_height=image_height,
+                processor=processor,
+            )
+            return grid_w * grid_h + 1, grid_h, grid_w
+
         if "longest_edge" not in image_processor.size:
             # Granite-docling format with height/width - no tiling supported
             return 1, 0, 0
@@ -194,6 +221,41 @@ class Idefics3ProcessingInfo(BaseProcessingInfo):
             image_width,
             self.ctx.get_merged_mm_kwargs(mm_kwargs),
         )
+
+    def _get_crop_to_patches_grid_size(
+        self,
+        *,
+        image_width: int,
+        image_height: int,
+        processor: Idefics3Processor | None,
+    ) -> tuple[int, int]:
+        """GotOcr2-compatible optimal grid calculation for crop_to_patches."""
+        if processor is None:
+            processor = self.get_hf_processor()
+
+        ip = processor.image_processor
+        max_patches = getattr(ip, 'max_patches', 16)
+        min_patches = getattr(ip, 'min_patches', 1)
+
+        image_ar = image_width / image_height
+        best_cols, best_rows = 1, 1
+        best_diff = float('inf')
+
+        for cols in range(1, max_patches + 1):
+            for rows in range(1, max_patches + 1):
+                total = cols * rows
+                if total < min_patches or total > max_patches:
+                    continue
+                diff = abs(image_ar - cols / rows)
+                if (diff < best_diff
+                        or (diff == best_diff
+                            and total > best_cols * best_rows)):
+                    best_diff = diff
+                    best_cols, best_rows = cols, rows
+
+        if best_cols * best_rows <= 1:
+            return (0, 0)
+        return (best_cols, best_rows)
 
     def get_num_patches(
         self,
@@ -300,7 +362,15 @@ class Idefics3DummyInputsBuilder(BaseDummyInputsBuilder[Idefics3ProcessingInfo])
         num_images = mm_counts.get("image", 0)
         hf_processor = self.info.get_hf_processor(**(mm_processor_kwargs or {}))
         image_processor: Idefics3ImageProcessor = hf_processor.image_processor
-        longest_edge = image_processor.max_image_size["longest_edge"]
+        if (hasattr(image_processor, 'max_image_size')
+                and isinstance(image_processor.max_image_size, dict)
+                and "longest_edge" in image_processor.max_image_size):
+            longest_edge = image_processor.max_image_size["longest_edge"]
+        else:
+            longest_edge = max(
+                image_processor.size.get("height", 512),
+                image_processor.size.get("width", 512),
+            )
 
         image_overrides = mm_options.get("image") if mm_options else None
 
@@ -356,7 +426,16 @@ class Idefics3MultiModalProcessor(BaseMultiModalProcessor[Idefics3ProcessingInfo
 
         # Remove the extra batch dimension
         processed_outputs["pixel_values"].squeeze_(0)
-        processed_outputs["pixel_attention_mask"].squeeze_(0)
+        if "pixel_attention_mask" in processed_outputs:
+            processed_outputs["pixel_attention_mask"].squeeze_(0)
+        else:
+            # GotOcr2ImageProcessor does not produce pixel_attention_mask;
+            # create an all-ones mask (all pixels valid, no padding).
+            pv = processed_outputs["pixel_values"]
+            processed_outputs["pixel_attention_mask"] = torch.ones(
+                pv.shape[0], pv.shape[2], pv.shape[3],
+                dtype=torch.bool, device=pv.device,
+            )
 
         return processed_outputs
 
