@@ -153,7 +153,14 @@ class Idefics3ProcessingInfo(BaseProcessingInfo):
     ) -> tuple[int, int]:
         hf_processor = self.get_hf_processor()
         image_processor: Idefics3ImageProcessor = hf_processor.image_processor
-        max_image_size = image_processor.size["longest_edge"]
+        # Handle both standard Idefics3 format and granite-docling format
+        if "longest_edge" in image_processor.size:
+            max_image_size = image_processor.size["longest_edge"]
+        else:
+            # Granite-docling format with height/width
+            max_image_size = max(image_processor.size.get("height", 512),
+                                image_processor.size.get("width", 512))
+
         if resolution_max_side > max_image_size:
             raise ValueError(
                 "`resolution_max_side` cannot be larger than `max_image_size`"
@@ -177,6 +184,10 @@ class Idefics3ProcessingInfo(BaseProcessingInfo):
         mm_kwargs: Mapping[str, object],
     ) -> tuple[int, int, int]:
         image_processor: Idefics3ImageProcessor = processor.image_processor
+
+        if "longest_edge" not in image_processor.size:
+            # Granite-docling format with height/width - no tiling supported
+            return 1, 0, 0
 
         return image_processor.get_number_of_image_patches(
             image_height,
@@ -726,7 +737,14 @@ class Idefics3ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsLo
         if pixel_values is not None:
             pixel_attention_mask = kwargs.pop("pixel_attention_mask")
             num_patches = kwargs.pop("num_patches")
-            expected_h = expected_w = self.config.vision_config.image_size
+
+            # Use actual pixel_values shape instead of config, to support models
+            # like granite-docling that use different image sizes
+            if pixel_values.ndim >= 3:
+                expected_h = pixel_values.shape[-2]
+                expected_w = pixel_values.shape[-1]
+            else:
+                expected_h = expected_w = self.config.vision_config.image_size
 
             return Idefics3ImagePixelInputs(
                 type="pixel_values",
