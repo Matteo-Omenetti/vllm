@@ -231,6 +231,30 @@ class Idefics3ProcessingInfo(BaseProcessingInfo):
             processor = self.get_hf_processor()
 
         ip = processor.image_processor
+
+        # Use the same get_optimal_tiled_canvas function that GotOcr2ImageProcessor
+        # uses internally so that our patch count exactly matches what the processor
+        # will produce (including the area-based tie-breaking logic).
+        try:
+            from transformers.models.got_ocr2.image_processing_got_ocr2 import (
+                get_optimal_tiled_canvas,
+            )
+            max_patches = getattr(ip, 'max_patches', 16)
+            min_patches = getattr(ip, 'min_patches', 1)
+            patch_size = ip.size  # {"height": h, "width": w}
+            num_columns, num_rows = get_optimal_tiled_canvas(
+                (image_height, image_width),
+                (patch_size["height"], patch_size["width"]),
+                min_patches,
+                max_patches,
+            )
+            if num_columns * num_rows <= 1:
+                return (0, 0)
+            return (num_columns, num_rows)
+        except ImportError:
+            pass
+
+        # Fallback: naive aspect-ratio search (may not match GotOcr2 exactly)
         max_patches = getattr(ip, 'max_patches', 16)
         min_patches = getattr(ip, 'min_patches', 1)
 
@@ -402,36 +426,81 @@ class Idefics3MultiModalProcessor(BaseMultiModalProcessor[Idefics3ProcessingInfo
             tok_kwargs,
         )
 
-        mm_items = self.info.parse_mm_data({"image": images}, validate=False)
-        parsed_images = mm_items.get_items("image", ImageProcessorItems)
-        image_sizes = [
-            parsed_images.get_image_size(i) for i in range(len(parsed_images))
-        ]
         hf_processor = self.info.get_hf_processor(**mm_kwargs)
+        is_crop_to_patches = getattr(
+            hf_processor.image_processor, 'crop_to_patches', False)
 
-        num_patches = [
-            self.info.get_num_patches(
-                image_width=size.width,
-                image_height=size.height,
-                processor=hf_processor,
-                mm_kwargs=mm_kwargs,
-            )
-            for size in image_sizes
-        ]
-        processed_outputs["num_patches"] = torch.tensor(num_patches)
-
-        # Remove the extra batch dimension
-        processed_outputs["pixel_values"].squeeze_(0)
-        if "pixel_attention_mask" in processed_outputs:
-            processed_outputs["pixel_attention_mask"].squeeze_(0)
-        else:
-            # GotOcr2ImageProcessor does not produce pixel_attention_mask;
-            # create an all-ones mask (all pixels valid, no padding).
+        if is_crop_to_patches:
+            # GotOcr2ImageProcessor returns pixel_values as [total_patches, C, H, W]
+            # with NO leading batch dimension. It also returns num_patches (total
+            # patches per input image, including the thumbnail) in the BatchFeature.
             pv = processed_outputs["pixel_values"]
+
+            # Use the num_patches the processor computed — it is accurate and avoids
+            # discrepancies with get_optimal_tiled_canvas tie-breaking.
+            num_patches_raw = processed_outputs.get("num_patches")
+            if num_patches_raw is not None:
+                if not isinstance(num_patches_raw, torch.Tensor):
+                    num_patches = torch.tensor(num_patches_raw, dtype=torch.long)
+                else:
+                    num_patches = num_patches_raw.long()
+            else:
+                # Fallback: compute from image sizes
+                mm_items = self.info.parse_mm_data(
+                    {"image": images}, validate=False)
+                parsed_images = mm_items.get_items("image", ImageProcessorItems)
+                image_sizes = [
+                    parsed_images.get_image_size(i)
+                    for i in range(len(parsed_images))
+                ]
+                num_patches = torch.tensor([
+                    self.info.get_num_patches(
+                        image_width=s.width,
+                        image_height=s.height,
+                        processor=hf_processor,
+                        mm_kwargs=mm_kwargs,
+                    )
+                    for s in image_sizes
+                ])
+
+            processed_outputs["num_patches"] = num_patches
+
+            # GotOcr2 does not produce pixel_attention_mask; create an all-ones
+            # mask of shape [total_patches, H, W].
             processed_outputs["pixel_attention_mask"] = torch.ones(
-                pv.shape[0], pv.shape[2], pv.shape[3],
+                pv.shape[0], pv.shape[-2], pv.shape[-1],
                 dtype=torch.bool, device=pv.device,
             )
+        else:
+            # Standard Idefics3ImageProcessor returns pixel_values as
+            # [batch=1, num_patches, C, H, W]; squeeze the batch dimension.
+            mm_items = self.info.parse_mm_data(
+                {"image": images}, validate=False)
+            parsed_images = mm_items.get_items("image", ImageProcessorItems)
+            image_sizes = [
+                parsed_images.get_image_size(i)
+                for i in range(len(parsed_images))
+            ]
+            num_patches = [
+                self.info.get_num_patches(
+                    image_width=size.width,
+                    image_height=size.height,
+                    processor=hf_processor,
+                    mm_kwargs=mm_kwargs,
+                )
+                for size in image_sizes
+            ]
+            processed_outputs["num_patches"] = torch.tensor(num_patches)
+
+            processed_outputs["pixel_values"].squeeze_(0)
+            if "pixel_attention_mask" in processed_outputs:
+                processed_outputs["pixel_attention_mask"].squeeze_(0)
+            else:
+                pv = processed_outputs["pixel_values"]
+                processed_outputs["pixel_attention_mask"] = torch.ones(
+                    pv.shape[0], pv.shape[-2], pv.shape[-1],
+                    dtype=torch.bool, device=pv.device,
+                )
 
         return processed_outputs
 
