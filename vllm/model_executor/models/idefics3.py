@@ -786,7 +786,7 @@ class Idefics3ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsLo
 
         with self._mark_composite_model(
             vllm_config,
-            language_targets=LlamaModel,
+            language_targets=(LlamaModel, GraniteMoeHybridModel),
             tower_targets={"image": (Idefics3VisionTransformer, Idefics3Connector)},
         ):
             self.model = Idefics3Model(
