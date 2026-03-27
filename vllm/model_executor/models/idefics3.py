@@ -435,13 +435,20 @@ class Idefics3MultiModalProcessor(BaseMultiModalProcessor[Idefics3ProcessingInfo
             hf_processor.image_processor, 'crop_to_patches', False)
 
         if is_crop_to_patches:
-            # GotOcr2ImageProcessor returns pixel_values as [total_patches, C, H, W]
-            # with NO leading batch dimension. It also returns num_patches (total
-            # patches per input image, including the thumbnail) in the BatchFeature.
+            # The modified Idefics3Processor (with GotOcr2ImageProcessor)
+            # returns pixel_values as [batch=1, total_patches, C, H, W] (5D)
+            # and may NOT include num_patches in its output (it gets consumed
+            # internally during prompt expansion).
+            # The raw GotOcr2ImageProcessor would return [total_patches, C, H, W]
+            # (4D).  Normalize both cases to 4D.
             pv = processed_outputs["pixel_values"]
+            if pv.ndim == 5:
+                # [batch=1, total_patches, C, H, W] → [total_patches, C, H, W]
+                pv = pv.squeeze(0)
+                processed_outputs["pixel_values"] = pv
 
-            # Use the num_patches the processor computed — it is accurate and avoids
-            # discrepancies with get_optimal_tiled_canvas tie-breaking.
+            # Use the num_patches the processor computed — it is accurate and
+            # avoids discrepancies with get_optimal_tiled_canvas tie-breaking.
             num_patches_raw = processed_outputs.get("num_patches")
             if num_patches_raw is not None:
                 if not isinstance(num_patches_raw, torch.Tensor):
@@ -449,7 +456,7 @@ class Idefics3MultiModalProcessor(BaseMultiModalProcessor[Idefics3ProcessingInfo
                 else:
                     num_patches = num_patches_raw.long()
             else:
-                # Fallback: compute from image sizes
+                # Fallback: compute from image sizes, or infer from pixel_values
                 mm_items = self.info.parse_mm_data(
                     {"image": images}, validate=False)
                 parsed_images = mm_items.get_items("image", ImageProcessorItems)
@@ -457,7 +464,8 @@ class Idefics3MultiModalProcessor(BaseMultiModalProcessor[Idefics3ProcessingInfo
                     parsed_images.get_image_size(i)
                     for i in range(len(parsed_images))
                 ]
-                num_patches = torch.tensor([
+
+                computed_patches = [
                     self.info.get_num_patches(
                         image_width=s.width,
                         image_height=s.height,
@@ -465,7 +473,28 @@ class Idefics3MultiModalProcessor(BaseMultiModalProcessor[Idefics3ProcessingInfo
                         mm_kwargs=mm_kwargs,
                     )
                     for s in image_sizes
-                ])
+                ]
+
+                # If computed patches don't sum to the actual tensor size,
+                # fall back to using the tensor dimension directly.
+                total_computed = sum(computed_patches)
+                if total_computed != pv.shape[0]:
+                    if len(image_sizes) == 1:
+                        # Single image: just use the actual number of patches.
+                        computed_patches = [pv.shape[0]]
+                    else:
+                        # Multi-image: distribute proportionally, ensuring
+                        # the sum exactly equals pv.shape[0].
+                        actual_total = pv.shape[0]
+                        ratio = actual_total / max(total_computed, 1)
+                        adjusted = [max(1, round(p * ratio))
+                                    for p in computed_patches]
+                        # Fix rounding residual on the last entry.
+                        diff = actual_total - sum(adjusted)
+                        adjusted[-1] = max(1, adjusted[-1] + diff)
+                        computed_patches = adjusted
+
+                num_patches = torch.tensor(computed_patches, dtype=torch.long)
 
             processed_outputs["num_patches"] = num_patches
 
@@ -806,7 +835,15 @@ class Idefics3ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsLo
         )
         if self.config.text_config.tie_word_embeddings:
             self.lm_head.weight = self.model.text_model.embed_tokens.weight
-        self.logits_processor = LogitsProcessor(config.text_config.vocab_size)
+
+        # GraniteMoeHybrid uses muP-style logits_scaling; honour it when present.
+        logits_scaling = getattr(config.text_config, "logits_scaling", 1.0)
+        logits_scale = (1.0 / logits_scaling) if logits_scaling != 1.0 else None
+        self.logits_processor = LogitsProcessor(
+            config.text_config.vocab_size,
+            config.text_config.vocab_size,
+            scale=logits_scale,
+        )
 
     def _parse_and_validate_image_input(self, **kwargs: object) -> ImageInputs | None:
         pixel_values = kwargs.pop("pixel_values", None)
@@ -824,6 +861,20 @@ class Idefics3ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsLo
         if pixel_values is not None:
             pixel_attention_mask = kwargs.pop("pixel_attention_mask")
             num_patches = kwargs.pop("num_patches")
+
+            # Some processor variants (e.g. GotOcr2 via Idefics3Processor)
+            # can emit an extra leading dimension.  Normalize to rank-4
+            # expected by Idefics3ImagePixelInputs: [total_patches, C, H, W].
+            if pixel_values.ndim == 5:
+                # [batch_or_1, total_patches, C, H, W] → flatten leading dims
+                pixel_values = pixel_values.reshape(
+                    -1, *pixel_values.shape[-3:])
+            if (
+                isinstance(pixel_attention_mask, torch.Tensor)
+                and pixel_attention_mask.ndim >= 4
+            ):
+                pixel_attention_mask = pixel_attention_mask.reshape(
+                    -1, *pixel_attention_mask.shape[-2:])
 
             # Use actual pixel_values shape instead of config, to support models
             # like granite-docling that use different image sizes
