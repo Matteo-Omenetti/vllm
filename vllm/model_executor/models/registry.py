@@ -408,6 +408,10 @@ _MULTIMODAL_MODELS = {
         "interns1_pro",
         "InternS1ProForConditionalGeneration",
     ),
+    "GraniteDoclingHybridForConditionalGeneration": (
+        "granite_docling_hybrid",
+        "GraniteDoclingHybridForConditionalGeneration",
+    ),
     "Idefics3ForConditionalGeneration": (
         "idefics3",
         "Idefics3ForConditionalGeneration",

@@ -845,6 +845,9 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         "tencent/HunyuanOCR",
         hf_overrides={"num_experts": 0},
     ),
+    "GraniteDoclingHybridForConditionalGeneration": _HfExamplesInfo(
+        "ibm-granite/granite-docling-258M",
+    ),
     "Idefics3ForConditionalGeneration": _HfExamplesInfo(
         "HuggingFaceM4/Idefics3-8B-Llama3",
         extras={"tiny": "HuggingFaceTB/SmolVLM-256M-Instruct"},
