@@ -16,6 +16,7 @@
 # limitations under the License.
 """Inference-only Idefics3 model compatible with HuggingFace weights."""
 
+import copy
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Annotated, Literal, TypeAlias
 
@@ -34,6 +35,7 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFunc
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
@@ -62,6 +64,7 @@ from .interfaces import (
     SupportsMultiModal,
 )
 from .llama import LlamaModel
+from .granitemoehybrid import GraniteMoeHybridForCausalLM, GraniteMoeHybridModel
 from .utils import AutoWeightsLoader, maybe_prefix
 
 
@@ -98,7 +101,25 @@ ImageInputs: TypeAlias = Idefics3ImagePixelInputs | Idefics3ImageEmbeddingInputs
 
 class Idefics3ProcessingInfo(BaseProcessingInfo):
     def get_hf_processor(self, **kwargs: object) -> Idefics3Processor:
-        return self.ctx.get_hf_processor(Idefics3Processor, **kwargs)
+        # return self.ctx.get_hf_processor(Idefics3Processor, **kwargs)
+        processor = self.ctx.get_hf_processor(Idefics3Processor, **kwargs)
+        # When the model specifies GotOcr2ImageProcessor (crop_to_patches
+        # mode) in its preprocessor config, the Idefics3Processor may load
+        # an Idefics3ImageProcessor instead.  The Idefics3ImageProcessor uses
+        # its own default max_image_size (364) producing patches that are
+        # incompatible with the vision model.  Swap in the correct processor.
+        ip = processor.image_processor
+        if (getattr(ip, 'crop_to_patches', False)
+                and type(ip).__name__ != 'GotOcr2ImageProcessor'):
+            if not hasattr(self, '_got_image_processor'):
+                from transformers import AutoImageProcessor
+                self._got_image_processor = (
+                    AutoImageProcessor.from_pretrained(
+                        self.ctx.model_config.model))
+            if type(self._got_image_processor).__name__ == (
+                    'GotOcr2ImageProcessor'):
+                processor.image_processor = self._got_image_processor
+        return processor
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"image": None}
@@ -147,7 +168,14 @@ class Idefics3ProcessingInfo(BaseProcessingInfo):
     ) -> tuple[int, int]:
         hf_processor = self.get_hf_processor()
         image_processor: Idefics3ImageProcessor = hf_processor.image_processor
-        max_image_size = image_processor.size["longest_edge"]
+        # max_image_size = image_processor.size["longest_edge"]
+        # Handle both standard Idefics3 format and granite-docling format
+        if "longest_edge" in image_processor.size:
+            max_image_size = image_processor.size["longest_edge"]
+        else:
+            # Granite-docling format with height/width
+            max_image_size = max(image_processor.size.get("height", 512),
+                                image_processor.size.get("width", 512))
         if resolution_max_side > max_image_size:
             raise ValueError(
                 "`resolution_max_side` cannot be larger than `max_image_size`"
@@ -172,12 +200,85 @@ class Idefics3ProcessingInfo(BaseProcessingInfo):
     ) -> tuple[int, int, int]:
         image_processor: Idefics3ImageProcessor = processor.image_processor
 
+        # GotOcr2-style crop_to_patches: find optimal grid based on
+        # aspect ratio, matching the GotOcr2ImageProcessor algorithm.
+        if getattr(image_processor, 'crop_to_patches', False):
+            grid_w, grid_h = self._get_crop_to_patches_grid_size(
+                image_width=image_width,
+                image_height=image_height,
+                processor=processor,
+            )
+            return grid_w * grid_h + 1, grid_h, grid_w
+
+        if "longest_edge" not in image_processor.size:
+            # Granite-docling format with height/width - no tiling supported
+            return 1, 0, 0
+        
         return image_processor.get_number_of_image_patches(
             image_height,
             image_width,
             self.ctx.get_merged_mm_kwargs(mm_kwargs),
         )
 
+    def _get_crop_to_patches_grid_size(
+        self,
+        *,
+        image_width: int,
+        image_height: int,
+        processor: Idefics3Processor | None,
+    ) -> tuple[int, int]:
+        """GotOcr2-compatible optimal grid calculation for crop_to_patches."""
+        if processor is None:
+            processor = self.get_hf_processor()
+
+        ip = processor.image_processor
+
+        # Use the same get_optimal_tiled_canvas function that GotOcr2ImageProcessor
+        # uses internally so that our patch count exactly matches what the processor
+        # will produce (including the area-based tie-breaking logic).
+        try:
+            from transformers.models.got_ocr2.image_processing_got_ocr2 import (
+                get_optimal_tiled_canvas,
+            )
+            max_patches = getattr(ip, 'max_patches', 16)
+            min_patches = getattr(ip, 'min_patches', 1)
+            patch_size = ip.size  # {"height": h, "width": w}
+            num_columns, num_rows = get_optimal_tiled_canvas(
+                (image_height, image_width),
+                (patch_size["height"], patch_size["width"]),
+                min_patches,
+                max_patches,
+            )
+            if num_columns * num_rows <= 1:
+                return (0, 0)
+            return (num_columns, num_rows)
+        except ImportError:
+            pass
+
+        # Fallback: naive aspect-ratio search (may not match GotOcr2 exactly)
+        max_patches = getattr(ip, 'max_patches', 16)
+        min_patches = getattr(ip, 'min_patches', 1)
+
+        image_ar = image_width / image_height
+        best_cols, best_rows = 1, 1
+        best_diff = float('inf')
+
+        for cols in range(1, max_patches + 1):
+            for rows in range(1, max_patches + 1):
+                total = cols * rows
+                if total < min_patches or total > max_patches:
+                    continue
+                diff = abs(image_ar - cols / rows)
+                if (diff < best_diff
+                        or (diff == best_diff
+                            and total > best_cols * best_rows)):
+                    best_diff = diff
+                    best_cols, best_rows = cols, rows
+
+        if best_cols * best_rows <= 1:
+            return (0, 0)
+        return (best_cols, best_rows)
+    
     def get_num_patches(
         self,
         *,
@@ -282,8 +383,18 @@ class Idefics3DummyInputsBuilder(BaseDummyInputsBuilder[Idefics3ProcessingInfo])
         num_images = mm_counts.get("image", 0)
         hf_processor = self.info.get_hf_processor()
         image_processor: Idefics3ImageProcessor = hf_processor.image_processor
-        longest_edge = image_processor.max_image_size["longest_edge"]
+        # longest_edge = image_processor.max_image_size["longest_edge"]
 
+        if (hasattr(image_processor, 'max_image_size')
+                and isinstance(image_processor.max_image_size, dict)
+                and "longest_edge" in image_processor.max_image_size):
+            longest_edge = image_processor.max_image_size["longest_edge"]
+        else:
+            longest_edge = max(
+                image_processor.size.get("height", 512),
+                image_processor.size.get("width", 512),
+            )
+            
         image_overrides = mm_options.get("image")
 
         return {
@@ -318,27 +429,97 @@ class Idefics3MultiModalProcessor(BaseMultiModalProcessor[Idefics3ProcessingInfo
             tok_kwargs,
         )
 
-        mm_items = self.info.parse_mm_data({"image": images}, validate=False)
-        parsed_images = mm_items.get_items("image", ImageProcessorItems)
-        image_sizes = [
-            parsed_images.get_image_size(i) for i in range(len(parsed_images))
-        ]
+        # mm_items = self.info.parse_mm_data({"image": images}, validate=False)
+        # parsed_images = mm_items.get_items("image", ImageProcessorItems)
+        # image_sizes = [
+        #     parsed_images.get_image_size(i) for i in range(len(parsed_images))
+        # ]
         hf_processor = self.info.get_hf_processor(**mm_kwargs)
 
-        num_patches = [
-            self.info.get_num_patches(
-                image_width=size.width,
-                image_height=size.height,
-                processor=hf_processor,
-                mm_kwargs=mm_kwargs,
-            )
-            for size in image_sizes
-        ]
-        processed_outputs["num_patches"] = torch.tensor(num_patches)
+        # num_patches = [
+        #     self.info.get_num_patches(
+        #         image_width=size.width,
+        #         image_height=size.height,
+        #         processor=hf_processor,
+        #         mm_kwargs=mm_kwargs,
+        #     )
+        #     for size in image_sizes
+        # ]
+        
+        is_crop_to_patches = getattr(
+            hf_processor.image_processor, 'crop_to_patches', False)
 
-        # Remove the extra batch dimension
-        processed_outputs["pixel_values"].squeeze_(0)
-        processed_outputs["pixel_attention_mask"].squeeze_(0)
+        if is_crop_to_patches:
+            # GotOcr2ImageProcessor returns pixel_values as [total_patches, C, H, W]
+            # with NO leading batch dimension. It also returns num_patches (total
+            # patches per input image, including the thumbnail) in the BatchFeature.
+            pv = processed_outputs["pixel_values"]
+
+            # Use the num_patches the processor computed — it is accurate and avoids
+            # discrepancies with get_optimal_tiled_canvas tie-breaking.
+            num_patches_raw = processed_outputs.get("num_patches")
+            if num_patches_raw is not None:
+                if not isinstance(num_patches_raw, torch.Tensor):
+                    num_patches = torch.tensor(num_patches_raw, dtype=torch.long)
+                else:
+                    num_patches = num_patches_raw.long()
+            else:
+                # Fallback: compute from image sizes
+                mm_items = self.info.parse_mm_data(
+                    {"image": images}, validate=False)
+                parsed_images = mm_items.get_items("image", ImageProcessorItems)
+                image_sizes = [
+                    parsed_images.get_image_size(i)
+                    for i in range(len(parsed_images))
+                ]
+                num_patches = torch.tensor([
+                    self.info.get_num_patches(
+                        image_width=s.width,
+                        image_height=s.height,
+                        processor=hf_processor,
+                        mm_kwargs=mm_kwargs,
+                    )
+                    for s in image_sizes
+                ])
+
+            processed_outputs["num_patches"] = num_patches
+
+            # GotOcr2 does not produce pixel_attention_mask; create an all-ones
+            # mask of shape [total_patches, H, W].
+            processed_outputs["pixel_attention_mask"] = torch.ones(
+                pv.shape[0], pv.shape[-2], pv.shape[-1],
+                dtype=torch.bool, device=pv.device,
+            )
+        else:
+            # Standard Idefics3ImageProcessor returns pixel_values as
+            # [batch=1, num_patches, C, H, W]; squeeze the batch dimension.
+            mm_items = self.info.parse_mm_data(
+                {"image": images}, validate=False)
+            parsed_images = mm_items.get_items("image", ImageProcessorItems)
+            image_sizes = [
+                parsed_images.get_image_size(i)
+                for i in range(len(parsed_images))
+            ]
+            num_patches = [
+                self.info.get_num_patches(
+                    image_width=size.width,
+                    image_height=size.height,
+                    processor=hf_processor,
+                    mm_kwargs=mm_kwargs,
+                )
+                for size in image_sizes
+            ]
+            processed_outputs["num_patches"] = torch.tensor(num_patches)
+
+            processed_outputs["pixel_values"].squeeze_(0)
+            if "pixel_attention_mask" in processed_outputs:
+                processed_outputs["pixel_attention_mask"].squeeze_(0)
+            else:
+                pv = processed_outputs["pixel_values"]
+                processed_outputs["pixel_attention_mask"] = torch.ones(
+                    pv.shape[0], pv.shape[-2], pv.shape[-1],
+                    dtype=torch.bool, device=pv.device,
+                )
 
         return processed_outputs
 
@@ -472,10 +653,27 @@ class Idefics3Model(nn.Module):
             quant_config,
             prefix=maybe_prefix(prefix, "connector"),
         )
-        self.text_model = LlamaModel(
-            vllm_config=vllm_config.with_hf_config(config.text_config),
-            prefix=maybe_prefix(prefix, "text_model"),
+        # self.text_model = LlamaModel(
+        #     vllm_config=vllm_config.with_hf_config(config.text_config),
+        #     prefix=maybe_prefix(prefix, "text_model"),
+        # )
+        text_config = config.text_config
+        is_granitemoehybrid = (
+            getattr(text_config, "model_type", None) == "granitemoehybrid"
+            or (hasattr(text_config, "layer_types")
+                and text_config.layer_types is not None)
         )
+        if is_granitemoehybrid:
+            self._configure_granite_hybrid_cache(vllm_config, text_config)
+            self.text_model = GraniteMoeHybridModel(
+                vllm_config=vllm_config.with_hf_config(text_config),
+                prefix=maybe_prefix(prefix, "text_model"),
+            )
+        else:
+            self.text_model = LlamaModel(
+                vllm_config=vllm_config.with_hf_config(text_config),
+                prefix=maybe_prefix(prefix, "text_model"),
+            )
 
         self.image_seq_len = int(
             ((config.vision_config.image_size // config.vision_config.patch_size) ** 2)
@@ -483,6 +681,16 @@ class Idefics3Model(nn.Module):
         )
         self.image_token_id = self.config.image_token_id
 
+    @staticmethod
+    def _configure_granite_hybrid_cache(
+        vllm_config: VllmConfig,
+        _text_config,
+    ) -> None:
+        from vllm.model_executor.models.config import (
+            HybridAttentionMambaModelConfig,
+        )
+        HybridAttentionMambaModelConfig.verify_and_update_config(vllm_config)
+        
     def image_pixels_to_features(
         self,
         pixel_values: torch.Tensor,
@@ -566,6 +774,27 @@ class Idefics3ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsLo
 
         raise ValueError("Only image modality is supported")
 
+    @classmethod
+    def get_mamba_state_shape_from_config(cls, vllm_config: VllmConfig):
+        text_config = vllm_config.model_config.hf_config.text_config
+        temp_vllm_config = copy.deepcopy(vllm_config)
+        temp_vllm_config.model_config.hf_config = text_config
+        return GraniteMoeHybridForCausalLM.get_mamba_state_shape_from_config(
+            temp_vllm_config)
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig):
+        text_config = vllm_config.model_config.hf_config.text_config
+        temp_vllm_config = copy.deepcopy(vllm_config)
+        temp_vllm_config.model_config.hf_config = text_config
+        return GraniteMoeHybridForCausalLM.get_mamba_state_dtype_from_config(
+            temp_vllm_config)
+
+    @classmethod
+    def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc,
+                                                MambaStateCopyFunc]:
+        return GraniteMoeHybridForCausalLM.get_mamba_state_copy_func()
+    
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -578,7 +807,7 @@ class Idefics3ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsLo
 
         with self._mark_composite_model(
             vllm_config,
-            language_targets=LlamaModel,
+            language_targets=(LlamaModel, GraniteMoeHybridModel),
             tower_targets={"image": (Idefics3VisionTransformer, Idefics3Connector)},
         ):
             self.model = Idefics3Model(
@@ -614,8 +843,16 @@ class Idefics3ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsLo
         if pixel_values is not None:
             pixel_attention_mask = kwargs.pop("pixel_attention_mask")
             num_patches = kwargs.pop("num_patches")
-            expected_h = expected_w = self.config.vision_config.image_size
+            # expected_h = expected_w = self.config.vision_config.image_size
 
+            # Use actual pixel_values shape instead of config, to support models
+            # like granite-docling that use different image sizes
+            if pixel_values.ndim >= 3:
+                expected_h = pixel_values.shape[-2]
+                expected_w = pixel_values.shape[-1]
+            else:
+                expected_h = expected_w = self.config.vision_config.image_size
+                
             return Idefics3ImagePixelInputs(
                 type="pixel_values",
                 pixel_values=pixel_values,
